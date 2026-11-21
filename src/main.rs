@@ -4,38 +4,43 @@
 //! and writes the two daily Parquet tables under OUTPUT_DIR.
 //!
 //! Stages:
-//!   1. small inputs (manifest, products, campaigns); links parsed in parallel
-//!   2. events and clicks parsed in parallel while one thread joins the links
-//!      into people; events are shuffled into buckets by event_id
-//!   3. per event_id bucket: dedup, then shuffle survivors and clicks by person
-//!   4. per person bucket: sessionize, attribute, aggregate, write Parquet
+//!   1. small inputs and links; all threads join linked IDs into people
+//!   2. one pass over events and clicks: each valid event writes a 16-byte
+//!      person record into its person's bucket, and every event line writes
+//!      a 16-byte event-ID record (with the person record's slot) into an
+//!      event-ID bucket; clicks go straight to their person's bucket
+//!   3. per event-ID bucket: duplicate copies that lose are marked dead in a
+//!      bitmap (nothing is moved)
+//!   4. per person bucket, largest first: skip dead records, group, sort,
+//!      sessionize, attribute, aggregate, write Parquet
 
+mod arena;
 mod csv;
 mod input;
 mod key;
 mod out;
 mod people;
-mod shuffle;
 mod ts;
+mod uf;
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use hashbrown::HashMap;
 
+use crate::arena::{Arena, BLOCK};
 use crate::csv::scan;
 use crate::input::{load, Input, Piece};
 use crate::key::{hash_key, key_cmp, pack, pack_fast, Key, KeyBuild};
 use crate::people::People;
-use crate::shuffle::Shuffle;
 use crate::ts::{parse_price, parse_ts, parse_ts_fast, DAY};
 
 const SESSION_GAP: i64 = 30 * 60 * 1000;
 const WEEK: i64 = 7 * DAY;
 const LATE: i64 = DAY;
 
-/// Number of buckets used for both shuffles (by event_id, then by person).
+/// Number of buckets, both by event ID and by person.
 const BUCKETS: usize = 512;
 const CHUNK: usize = 2 << 20;
 
@@ -43,32 +48,33 @@ const T_VIEW: u8 = 1;
 const T_CART: u8 = 2;
 const T_PURCHASE: u8 = 3;
 const PRICE_MASK: u32 = (1 << 24) - 1;
+/// Slot of an event line that is not a valid event.
+const NO_SLOT: u32 = u32::MAX;
+/// Category code meaning "look the category up by slot" (more than 254
+/// categories).
+const WIDE_CAT: u32 = 255;
 
-/// One parsed event line. `pt` holds the price in its low 24 bits and the
-/// type above them; 0 means the copy is invalid. `ingest` is in seconds and
-/// `ts` in milliseconds, both relative to `Small::base`.
+/// A valid event in its person's bucket. `pt` holds the price in its low 24
+/// bits and, for a purchase, category + 1 above them (0 for view and cart).
 #[derive(Clone, Copy)]
 #[repr(C)]
-struct Ev {
-    eid: Key,
-    user: Key,
-    ingest: i32,
-    ts: u32,
-    pt: u32,
-    cat: u16,
-}
-
-/// A surviving event, keyed by its person.
-#[derive(Clone, Copy)]
-#[repr(C)]
-struct Sv {
+struct Pr {
     person: Key,
     ts: u32,
     pt: u32,
-    cat: u16,
 }
 
-/// A valid click, keyed by its person (by its user until links are applied).
+/// One event line in its event-ID bucket: ingest time in seconds (relative)
+/// and the slot of its person record, or NO_SLOT if the line is invalid.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct Er {
+    eid: Key,
+    ingest: i32,
+    slot: u32,
+}
+
+/// A valid click in its person's bucket.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct Ck {
@@ -78,9 +84,20 @@ struct Ck {
     camp: u32,
 }
 
+/// An event as the sessions stage works with it.
+#[derive(Clone, Copy)]
+struct Sv {
+    person: Key,
+    ts: u32,
+    price: u32,
+    /// Category for a purchase, u16::MAX otherwise.
+    cat: u16,
+}
+
 /// Per-campaign, per-day counters: credited sessions, purchasing sessions,
 /// revenue, assisted sessions.
 type CampAgg = Vec<[i64; 4]>;
+
 
 #[inline(always)]
 fn bucket_of(k: Key) -> usize {
@@ -142,69 +159,6 @@ fn run_parallel<F: Fn(usize) + Sync>(threads: usize, f: F) {
         }
         f(0);
     });
-}
-
-/// A union-find over link IDs, giving each linked ID its person's name.
-fn build_people(links: Vec<Vec<(Key, Key)>>) -> People {
-    let total: usize = links.iter().map(|v| v.len()).sum();
-    let mut index: HashMap<Key, u32, KeyBuild> = HashMap::with_capacity_and_hasher(total, KeyBuild);
-    let mut ids: Vec<Key> = Vec::with_capacity(total);
-    let mut parent: Vec<u32> = Vec::with_capacity(total);
-    fn find(parent: &mut [u32], mut x: u32) -> u32 {
-        while parent[x as usize] != x {
-            let p = parent[x as usize];
-            parent[x as usize] = parent[p as usize];
-            x = p;
-        }
-        x
-    }
-    let mut intern = |k: Key, ids: &mut Vec<Key>, parent: &mut Vec<u32>| -> u32 {
-        *index.entry(k).or_insert_with(|| {
-            ids.push(k);
-            parent.push(parent.len() as u32);
-            (ids.len() - 1) as u32
-        })
-    };
-    for part in &links {
-        for &(a, b) in part {
-            if a == b {
-                intern(a, &mut ids, &mut parent);
-                continue;
-            }
-            let ia = intern(a, &mut ids, &mut parent);
-            let ib = intern(b, &mut ids, &mut parent);
-            let ra = find(&mut parent, ia);
-            let rb = find(&mut parent, ib);
-            if ra != rb {
-                if ra < rb {
-                    parent[rb as usize] = ra;
-                } else {
-                    parent[ra as usize] = rb;
-                }
-            }
-        }
-    }
-    let n = ids.len();
-    let mut name: Vec<Key> = vec![0; n];
-    let mut has: Vec<bool> = vec![false; n];
-    let mut root = vec![0u32; n];
-    for i in 0..n {
-        let r = find(&mut parent, i as u32);
-        root[i] = r;
-        let r = r as usize;
-        if !has[r] || key_cmp(ids[i], name[r]).is_lt() {
-            name[r] = ids[i];
-            has[r] = true;
-        }
-    }
-    let mut pairs = Vec::with_capacity(n);
-    for i in 0..n {
-        let nm = name[root[i] as usize];
-        if nm != ids[i] {
-            pairs.push((ids[i], nm));
-        }
-    }
-    People::new(&pairs)
 }
 
 struct Small {
@@ -269,8 +223,16 @@ fn event_type(t: &[u8]) -> u8 {
     }
 }
 
+/// What one event line becomes.
+enum Line {
+    /// A valid event, not yet placed: (eid, ingest, user, ts, pt, cat).
+    Valid(Key, i32, Key, u32, u32, u16),
+    /// A line with an event ID that is not a valid event.
+    Invalid(Key, i32),
+}
+
 #[inline(always)]
-fn parse_event(f: &[&[u8]; 7], sm: &Small, lim: usize) -> Option<Ev> {
+fn parse_event(f: &[&[u8]; 7], sm: &Small, lim: usize) -> Option<Line> {
     if f[0].is_empty() {
         return None;
     }
@@ -278,34 +240,35 @@ fn parse_event(f: &[&[u8]; 7], sm: &Small, lim: usize) -> Option<Ev> {
     let eid = pack_fast(f[0], ok16(f[0]));
     let ingest = parse_ts(f[3]).unwrap_or(i64::MAX / 2);
     let ingest_rel = (ingest - sm.base).div_euclid(1000).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
-    let mut ev = Ev { eid, user: 0, ingest: ingest_rel, ts: 0, pt: 0, cat: 0 };
+    let bad = Some(Line::Invalid(eid, ingest_rel));
     let user = f[1];
     if user.is_empty() || f[5].is_empty() {
-        return Some(ev);
+        return bad;
     }
     let typ = event_type(f[4]);
     if typ == 0 {
-        return Some(ev);
+        return bad;
     }
     let ts = match parse_ts_fast(f[2], ok16(f[2])) {
         Some(t) if t >= sm.ws && t < sm.we => t,
-        _ => return Some(ev),
+        _ => return bad,
     };
     if ingest - ts > LATE {
-        return Some(ev);
+        return bad;
     }
-    let mut price = 0u32;
+    let mut pt = 0u32;
+    let mut cat = u16::MAX;
     if typ == T_PURCHASE {
-        match parse_price(f[6]) {
-            Some(p) => price = p,
-            None => return Some(ev),
-        }
-        ev.cat = *sm.product_cat.get(&pack(f[5])).unwrap_or(&sm.unknown_cat);
+        let price = match parse_price(f[6]) {
+            Some(p) => p,
+            None => return bad,
+        };
+        cat = *sm.product_cat.get(&pack_fast(f[5], ok16(f[5]))).unwrap_or(&sm.unknown_cat);
+        let code = if (cat as u32) < WIDE_CAT - 1 { cat as u32 + 1 } else { WIDE_CAT };
+        pt = price | code << 24;
     }
-    ev.user = pack_fast(user, ok16(user));
-    ev.ts = (ts - sm.base) as u32;
-    ev.pt = price | (typ as u32) << 24;
-    Some(ev)
+    let _ = (T_VIEW, T_CART);
+    Some(Line::Valid(eid, ingest_rel, pack_fast(user, ok16(user)), (ts - sm.base) as u32, pt, cat))
 }
 
 #[inline(always)]
@@ -338,28 +301,27 @@ fn main() {
             eprintln!("{:>8.1} ms  {}", t0.elapsed().as_secs_f64() * 1000.0, what);
         }
     };
-
     ts::init();
-    let sm = load_small(&data);
-    let links_in = Input::open(&data.join("links"));
-    let events_in = Input::open(&data.join("events"));
-    let clicks_in = Input::open(&data.join("clicks"));
-    mark("small");
 
-    // ---- links: parse in parallel ----
-    let mut link_chunks: Vec<Piece> = Vec::new();
-    links_in.pieces(CHUNK as u64, &mut link_chunks);
+    // ---- small inputs (one thread) while the others parse links ----
+    let links_in = Input::open(&data.join("links"));
+    let mut link_pieces: Vec<Piece> = Vec::new();
+    links_in.pieces(CHUNK as u64 / 4, &mut link_pieces);
+    let small_cell: OnceLock<Small> = OnceLock::new();
     let next = AtomicUsize::new(0);
     let link_parts: Vec<Mutex<Vec<(Key, Key)>>> = (0..threads).map(|_| Mutex::new(Vec::new())).collect();
     run_parallel(threads, |t| {
+        if t == 0 {
+            let _ = small_cell.set(load_small(&data));
+        }
         let mut local = Vec::new();
         let mut buf = Vec::new();
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
-            if i >= link_chunks.len() {
+            if i >= link_pieces.len() {
                 break;
             }
-            let (a, b) = load(&links_in, link_chunks[i], &mut buf);
+            let (a, b) = load(&links_in, link_pieces[i], &mut buf);
             scan::<2, _>(&buf[a..b], |f| {
                 if !f[0].is_empty() && !f[1].is_empty() {
                     local.push((pack(f[0]), pack(f[1])));
@@ -368,13 +330,17 @@ fn main() {
         }
         *link_parts[t].lock().unwrap() = local;
     });
+    let sm = small_cell.into_inner().unwrap();
     let link_parts: Vec<Vec<(Key, Key)>> = link_parts.into_iter().map(|m| m.into_inner().unwrap()).collect();
-    mark("links parsed");
+    mark("small + links parsed");
+    let people: People = uf::build(&link_parts, threads);
+    drop(link_parts);
+    mark("people");
 
-    // ---- events and clicks; thread 0 first joins the links into people ----
+    // ---- one pass over events and clicks ----
+    let events_in = Input::open(&data.join("events"));
+    let clicks_in = Input::open(&data.join("clicks"));
     let mut work: Vec<(bool, Piece)> = Vec::new();
-    let event_bytes = events_in.bytes() as usize;
-    let click_bytes = clicks_in.bytes() as usize;
     {
         let mut tmp = Vec::new();
         events_in.pieces(CHUNK as u64, &mut tmp);
@@ -382,24 +348,56 @@ fn main() {
         clicks_in.pieces(CHUNK as u64, &mut tmp);
         work.extend(tmp.drain(..).map(|p| (false, p)));
     }
-    let ev_shuffle: Shuffle<Ev> = Shuffle::new(event_bytes / 64 + 1024, BUCKETS);
-    let people_cell: OnceLock<People> = OnceLock::new();
-    let link_parts = Mutex::new(Some(link_parts));
+    // Every event line is at least 28 bytes and every click line 20, so
+    // these bound the record counts.
+    let event_bytes = events_in.bytes() as usize;
+    let click_bytes = clicks_in.bytes() as usize;
+    let pr_arena: Arena<Pr> = Arena::new(event_bytes / 28 + 1, BUCKETS, threads);
+    let er_arena: Arena<Er> = Arena::new(event_bytes / 28 + 1, BUCKETS, threads);
+    let ck_arena: Arena<Ck> = Arena::new(click_bytes / 20 + 1, BUCKETS, threads);
+    let wide: Mutex<HashMap<u32, u16>> = Mutex::new(HashMap::new());
     let next = AtomicUsize::new(0);
-    // Clicks are parsed last; by then the people are known, so each click goes
-    // straight into its person's bucket.
-    let ck_shuffle: Shuffle<Ck> = Shuffle::new(click_bytes / 40 + 1024, BUCKETS);
+    let filled: Vec<Mutex<Option<(arena::Filled, arena::Filled, arena::Filled)>>> =
+        (0..threads).map(|_| Mutex::new(None)).collect();
+    const BATCH: usize = 32;
     run_parallel(threads, |t| {
-        if t == 0 {
-            let parts = link_parts.lock().unwrap().take().unwrap();
-            let _ = people_cell.set(build_people(parts));
-            mark("people (thread 0)");
-        }
         let c0 = thread_cpu();
-        let mut w = ev_shuffle.writer();
-        let mut cw = ck_shuffle.writer();
-        let mut pending: Vec<Ck> = Vec::with_capacity(64);
-        let mut buf: Vec<u8> = Vec::with_capacity(CHUNK + (128 << 10));
+        let mut pw = pr_arena.writer();
+        let mut ew = er_arena.writer();
+        let mut cw = ck_arena.writer();
+        let mut buf: Vec<u8> = Vec::new();
+        // Valid events and clicks wait in small batches so their person
+        // lookups can be prefetched together.
+        let mut evb: Vec<(Key, i32, Key, u32, u32, u16)> = Vec::with_capacity(BATCH);
+        let mut ckb: Vec<Ck> = Vec::with_capacity(BATCH);
+        let mut my_wide: Vec<(u32, u16)> = Vec::new();
+        let flush_ev = |evb: &mut Vec<(Key, i32, Key, u32, u32, u16)>,
+                            pw: &mut arena::Writer<Pr>,
+                            ew: &mut arena::Writer<Er>,
+                            my_wide: &mut Vec<(u32, u16)>| {
+            for e in evb.iter() {
+                people.prefetch(e.2);
+            }
+            for &(eid, ingest, user, ts, pt, cat) in evb.iter() {
+                let person = people.get(user);
+                let slot = pw.push(bucket_of(person), Pr { person, ts, pt });
+                if pt >> 24 == WIDE_CAT {
+                    my_wide.push((slot, cat));
+                }
+                ew.push(bucket_of(eid), Er { eid, ingest, slot });
+            }
+            evb.clear();
+        };
+        let flush_ck = |ckb: &mut Vec<Ck>, cw: &mut arena::Writer<Ck>| {
+            for c in ckb.iter() {
+                people.prefetch(c.person);
+            }
+            for c in ckb.drain(..) {
+                let mut c = c;
+                c.person = people.get(c.person);
+                cw.push(bucket_of(c.person), c);
+            }
+        };
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
             if i >= work.len() {
@@ -408,118 +406,104 @@ fn main() {
             let (is_event, piece) = work[i];
             let inp = if is_event { &events_in } else { &clicks_in };
             let (chunk, lim): (&[u8], usize) = if inp.maps.is_empty() {
-                // Fallback: no mapping.
+                // Fallback: no mapping. The buffer keeps zero padding after
+                // the data, so 16-byte loads past any field stay inside it.
                 let (a, b) = load(inp, piece, &mut buf);
-                // The buffer keeps zero padding after the data, so 16-byte
-                // loads past any field stay inside it.
                 (&buf[a..b], buf.as_ptr() as usize + buf.len())
             } else {
                 let (m, a, b) = inp.view(piece);
                 (&m[a..b], m.as_ptr() as usize + m.len())
             };
             if is_event {
-                scan::<7, _>(chunk, |f| {
-                    if let Some(ev) = parse_event(f, &sm, lim) {
-                        w.push(bucket_of(ev.eid), ev);
+                scan::<7, _>(chunk, |f| match parse_event(f, &sm, lim) {
+                    Some(Line::Valid(eid, ingest, user, ts, pt, cat)) => {
+                        evb.push((eid, ingest, user, ts, pt, cat));
+                        if evb.len() == BATCH {
+                            flush_ev(&mut evb, &mut pw, &mut ew, &mut my_wide);
+                        }
                     }
+                    Some(Line::Invalid(eid, ingest)) => {
+                        ew.push(bucket_of(eid), Er { eid, ingest, slot: NO_SLOT });
+                    }
+                    None => {}
                 });
+                flush_ev(&mut evb, &mut pw, &mut ew, &mut my_wide);
             } else {
-                let people = people_cell.wait();
-                // Resolve people in small batches so the lookups can be
-                // prefetched.
-                let mut flush = |pending: &mut Vec<Ck>| {
-                    for c in pending.iter() {
-                        people.prefetch(c.person);
-                    }
-                    for c in pending.drain(..) {
-                        let mut c = c;
-                        c.person = people.get(c.person);
-                        cw.push(bucket_of(c.person), c);
-                    }
-                };
                 scan::<4, _>(chunk, |f| {
                     if let Some(c) = parse_click(f, &sm, lim) {
-                        pending.push(c);
-                        if pending.len() == 32 {
-                            flush(&mut pending);
+                        ckb.push(c);
+                        if ckb.len() == BATCH {
+                            flush_ck(&mut ckb, &mut cw);
                         }
                     }
                 });
-                flush(&mut pending);
+                flush_ck(&mut ckb, &mut cw);
             }
         }
-        w.finish();
-        cw.finish();
+        if !my_wide.is_empty() {
+            wide.lock().unwrap().extend(my_wide);
+        }
+        *filled[t].lock().unwrap() = Some((pw.finish(), ew.finish(), cw.finish()));
         add_cpu(0, thread_cpu() - c0);
     });
-    let people = people_cell.get().unwrap();
-    // How far ahead person lookups are prefetched.
-    const AHEAD: usize = 24;
+    let (mut pf, mut ef, mut cf) = (Vec::new(), Vec::new(), Vec::new());
+    for m in filled {
+        let (p, e, c) = m.into_inner().unwrap().unwrap();
+        pf.push(p);
+        ef.push(e);
+        cf.push(c);
+    }
+    let pr_lists = arena::merge(pf, BUCKETS);
+    let er_lists = arena::merge(ef, BUCKETS);
+    let ck_lists = arena::merge(cf, BUCKETS);
+    let wide = wide.into_inner().unwrap();
     mark("parse");
 
-    // ---- dedup by event_id; bucket survivors and clicks by person ----
-    let sv_shuffle: Shuffle<Sv> = Shuffle::new(event_bytes / 64 + 1024, BUCKETS);
+    // ---- dedup: mark the losing copies dead ----
+    let dead: Vec<AtomicU64> = (0..pr_arena.slots() / 64 + 1).map(|_| AtomicU64::new(0)).collect();
+    let kill = |s: u32| {
+        if s != NO_SLOT {
+            dead[s as usize / 64].fetch_or(1 << (s % 64), Ordering::Relaxed);
+        }
+    };
     let next = AtomicUsize::new(0);
     run_parallel(threads, |_t| {
         let c0 = thread_cpu();
-        let mut winners: Vec<u32> = Vec::new();
-        let mut win: Vec<u64> = Vec::new();
-        let mut w = sv_shuffle.writer();
         let mut seen: HashMap<Key, (i32, u32), KeyBuild> = HashMap::with_hasher(KeyBuild);
         loop {
             let b = next.fetch_add(1, Ordering::Relaxed);
             if b >= BUCKETS {
                 break;
             }
-            let (main, extra) = ev_shuffle.bucket(b);
-            let all_len = main.len() + extra.len();
-            let get = |i: usize| -> &Ev { if i < main.len() { &main[i] } else { &extra[i - main.len()] } };
+            let n: usize = er_lists[b].iter().map(|x| x.1 as usize).sum();
             seen.clear();
-            seen.reserve(all_len);
-            // Keep the copy with the smallest ingest_ts; copies with equal
-            // ingest_ts are identical, so the first one seen is kept.
-            for i in 0..all_len {
-                let ev = get(i);
-                match seen.entry(ev.eid) {
-                    hashbrown::hash_map::Entry::Vacant(v) => {
-                        v.insert((ev.ingest, i as u32));
-                    }
-                    hashbrown::hash_map::Entry::Occupied(mut o) => {
-                        if ev.ingest < o.get().0 {
-                            o.insert((ev.ingest, i as u32));
+            seen.reserve(n);
+            // The copy with the smallest ingest_ts is kept; copies with equal
+            // ingest_ts are identical, so the first one seen stays. Every
+            // other copy is dead, and if the kept copy is invalid, so is the
+            // whole event.
+            for &(blk, cnt) in &er_lists[b] {
+                for r in er_arena.block(blk, cnt) {
+                    match seen.entry(r.eid) {
+                        hashbrown::hash_map::Entry::Vacant(v) => {
+                            v.insert((r.ingest, r.slot));
+                        }
+                        hashbrown::hash_map::Entry::Occupied(mut o) => {
+                            let (ci, cs) = *o.get();
+                            if r.ingest < ci {
+                                kill(cs);
+                                o.insert((r.ingest, r.slot));
+                            } else {
+                                kill(r.slot);
+                            }
                         }
                     }
                 }
             }
-            win.clear();
-            win.resize(all_len.div_ceil(64), 0);
-            for &(_, i) in seen.values() {
-                win[i as usize / 64] |= 1 << (i % 64);
-            }
-            winners.clear();
-            for (wi, &word) in win.iter().enumerate() {
-                let mut bits = word;
-                while bits != 0 {
-                    let i = wi * 64 + bits.trailing_zeros() as usize;
-                    bits &= bits - 1;
-                    if get(i).pt != 0 {
-                        winners.push(i as u32);
-                    }
-                }
-            }
-            for (k, &i) in winners.iter().enumerate() {
-                if let Some(&a) = winners.get(k + AHEAD) {
-                    people.prefetch(get(a as usize).user);
-                }
-                let ev = get(i as usize);
-                let person = people.get(ev.user);
-                w.push(bucket_of(person), Sv { person, ts: ev.ts, pt: ev.pt, cat: ev.cat });
-            }
         }
-        w.finish();
         add_cpu(1, thread_cpu() - c0);
     });
-    drop(ev_shuffle);
+    drop(er_arena);
     mark("dedup");
 
     // ---- sessions, attribution, aggregation ----
@@ -532,6 +516,14 @@ fn main() {
     let cd_dir = output.join("campaign_daily");
     std::fs::create_dir_all(&ud_dir).expect("create user_daily");
     std::fs::create_dir_all(&cd_dir).expect("create campaign_daily");
+    // Largest buckets first, so a bucket holding a very active person does
+    // not leave one thread working alone at the end.
+    let mut order: Vec<usize> = (0..BUCKETS).collect();
+    let size_of = |b: usize| -> usize {
+        pr_lists[b].iter().map(|x| x.1 as usize).sum::<usize>() + ck_lists[b].iter().map(|x| x.1 as usize).sum::<usize>()
+    };
+    let sizes: Vec<usize> = (0..BUCKETS).map(size_of).collect();
+    order.sort_by_key(|&b| std::cmp::Reverse(sizes[b]));
     let next = AtomicUsize::new(0);
     let camp_aggs: Vec<Mutex<CampAgg>> = (0..threads).map(|_| Mutex::new(Vec::new())).collect();
     run_parallel(threads, |t| {
@@ -546,17 +538,17 @@ fn main() {
         let mut ev_starts: Vec<u32> = Vec::new();
         let mut ck_starts: Vec<u32> = Vec::new();
         loop {
-            let b = next.fetch_add(1, Ordering::Relaxed);
-            if b >= BUCKETS {
+            let k = next.fetch_add(1, Ordering::Relaxed);
+            if k >= BUCKETS {
                 break;
             }
-            // Radix-partition this bucket's events and clicks by a few hash
-            // bits of the person, then sort each small part by (person, ts).
-            // Within every part, persons come out in key order for both.
-            let (m, x) = sv_shuffle.bucket(b);
-            radix_parts(m, &x, |e| e.person, &mut evs, &mut ev_starts);
-            let (m, x) = ck_shuffle.bucket(b);
-            radix_parts(m, &x, |c| c.person, &mut cks, &mut ck_starts);
+            let b = order[k];
+            // Live events of this bucket, radix-partitioned by a few hash
+            // bits of the person; then each small part is sorted by
+            // (person, ts). Within every part persons come out in key order
+            // for both events and clicks.
+            gather_events(&pr_arena, &pr_lists[b], &dead, &wide, &mut evs, &mut ev_starts);
+            gather_clicks(&ck_arena, &ck_lists[b], &mut cks, &mut ck_starts);
             for p in 0..SUB {
                 let g = &mut evs[ev_starts[p] as usize..ev_starts[p + 1] as usize];
                 if g.len() <= 24 {
@@ -631,8 +623,8 @@ fn main() {
                     let mut rev = 0i64;
                     let mut purchased = false;
                     for ev in &evs[k..e] {
-                        if ev.pt >> 24 == T_PURCHASE as u32 {
-                            let price = (ev.pt & PRICE_MASK) as i64;
+                        if ev.cat != u16::MAX {
+                            let price = ev.price as i64;
                             purchased = true;
                             rev += price;
                             match day_cats.iter_mut().find(|c| c.0 == ev.cat) {
@@ -719,7 +711,7 @@ fn main() {
 }
 
 /// Parts per person bucket in the sessions stage.
-const SUB: usize = 2048;
+const SUB: usize = 4096;
 
 /// The part of a person within its bucket (hash bits not used by bucket_of).
 #[inline(always)]
@@ -727,14 +719,28 @@ fn sub_of(k: Key) -> usize {
     hash_key(k) as usize & (SUB - 1)
 }
 
-/// Counting sort of `main` + `extra` into `out` by `sub_of(key(x))`;
+/// Collects a bucket's live events into `out`, partitioned by `sub_of`;
 /// `starts[p]..starts[p + 1]` is part p.
-fn radix_parts<T: Copy, F: Fn(&T) -> Key>(main: &[T], extra: &[T], key: F, out: &mut Vec<T>, starts: &mut Vec<u32>) {
-    let n = main.len() + extra.len();
+fn gather_events(
+    arena: &Arena<Pr>,
+    blocks: &[(u32, u16)],
+    dead: &[AtomicU64],
+    wide: &HashMap<u32, u16>,
+    out: &mut Vec<Sv>,
+    starts: &mut Vec<u32>,
+) {
     starts.clear();
     starts.resize(SUB + 1, 0);
-    for x in main.iter().chain(extra.iter()) {
-        starts[sub_of(key(x)) + 1] += 1;
+    let is_dead = |slot: usize| dead[slot / 64].load(Ordering::Relaxed) >> (slot % 64) & 1 != 0;
+    let mut n = 0usize;
+    for &(blk, cnt) in blocks {
+        let base = blk as usize * BLOCK;
+        for (i, r) in arena.block(blk, cnt).iter().enumerate() {
+            if !is_dead(base + i) {
+                starts[sub_of(r.person) + 1] += 1;
+                n += 1;
+            }
+        }
     }
     for p in 0..SUB {
         starts[p + 1] += starts[p];
@@ -744,10 +750,52 @@ fn radix_parts<T: Copy, F: Fn(&T) -> Key>(main: &[T], extra: &[T], key: F, out: 
     let mut fill: Vec<u32> = starts[..SUB].to_vec();
     unsafe {
         let o = out.as_mut_ptr();
-        for x in main.iter().chain(extra.iter()) {
-            let p = sub_of(key(x));
-            o.add(fill[p] as usize).write(*x);
-            fill[p] += 1;
+        for &(blk, cnt) in blocks {
+            let base = blk as usize * BLOCK;
+            for (i, r) in arena.block(blk, cnt).iter().enumerate() {
+                if is_dead(base + i) {
+                    continue;
+                }
+                let code = r.pt >> 24;
+                let cat = match code {
+                    0 => u16::MAX,
+                    WIDE_CAT => wide[&((base + i) as u32)],
+                    c => (c - 1) as u16,
+                };
+                let p = sub_of(r.person);
+                o.add(fill[p] as usize).write(Sv { person: r.person, ts: r.ts, price: r.pt & PRICE_MASK, cat });
+                fill[p] += 1;
+            }
+        }
+        out.set_len(n);
+    }
+}
+
+/// Collects a bucket's clicks into `out`, partitioned like the events.
+fn gather_clicks(arena: &Arena<Ck>, blocks: &[(u32, u16)], out: &mut Vec<Ck>, starts: &mut Vec<u32>) {
+    starts.clear();
+    starts.resize(SUB + 1, 0);
+    let mut n = 0usize;
+    for &(blk, cnt) in blocks {
+        for c in arena.block(blk, cnt) {
+            starts[sub_of(c.person) + 1] += 1;
+        }
+        n += cnt as usize;
+    }
+    for p in 0..SUB {
+        starts[p + 1] += starts[p];
+    }
+    out.clear();
+    out.reserve(n);
+    let mut fill: Vec<u32> = starts[..SUB].to_vec();
+    unsafe {
+        let o = out.as_mut_ptr();
+        for &(blk, cnt) in blocks {
+            for c in arena.block(blk, cnt) {
+                let p = sub_of(c.person);
+                o.add(fill[p] as usize).write(*c);
+                fill[p] += 1;
+            }
         }
         out.set_len(n);
     }
