@@ -65,28 +65,38 @@ fn slow_days(year: i64, month: i64, day: i64) -> Option<i64> {
     if day > dim { None } else { Some(days_from_civil(year, month, day)) }
 }
 
-/// `YYYY-MM-DDTHH:MM:SS` at the start of `s` (at least 19 bytes), as epoch
-/// ms in local time.
+/// `YYYY-MM-DDTHH:MM:SS` at the start of `s` (at least 20 bytes), as epoch
+/// ms in local time. Validates and converts eight bytes at a time.
 #[inline(always)]
 fn civil_ms(s: &[u8]) -> Option<i64> {
-    let b: &[u8; 19] = s[..19].try_into().unwrap();
-    let sep = (b[4] ^ b'-') | (b[7] ^ b'-') | (b[10] ^ b'T') | (b[13] ^ b':') | (b[16] ^ b':');
-    let v = |i: usize| b[i].wrapping_sub(b'0');
-    let digits = [v(0), v(1), v(2), v(3), v(5), v(6), v(8), v(9), v(11), v(12), v(14), v(15), v(17), v(18)];
-    let mut over = 0u8;
-    for d in digits {
-        over |= (d > 9) as u8;
-    }
-    if (sep | over) != 0 {
+    const Z: u64 = 0x3030_3030_3030_3030;
+    const ADD: u64 = 0x7676_7676_7676_7676;
+    let a = u64::from_le_bytes(s[0..8].try_into().unwrap()); // YYYY-MM-
+    let b = u64::from_le_bytes(s[8..16].try_into().unwrap()); // DDTHH:MM
+    let c = u32::from_le_bytes(s[16..20].try_into().unwrap()); // :SS?
+    // Separators.
+    let sep_ok = (a & 0xFF00_00FF_0000_0000) == 0x2D00_002D_0000_0000
+        && (b & 0x0000_FF00_00FF_0000) == 0x0000_3A00_0054_0000
+        && (c & 0xFF) == 0x3A;
+    // Digits: after xor with '0' every digit byte must be 0..=9.
+    let da = (a ^ Z) & 0x00FF_FF00_FFFF_FFFF;
+    let db = (b ^ Z) & 0xFFFF_00FF_FF00_FFFF;
+    let dc = ((c ^ 0x3030_3030) & 0x00FF_FF00) as u64;
+    let bad = ((da.wrapping_add(ADD) | da) & 0x0080_8000_8080_8080)
+        | ((db.wrapping_add(ADD) | db) & 0x8080_0080_8000_8080)
+        | ((dc.wrapping_add(ADD) | dc) & 0x0000_0000_0080_8000);
+    if !sep_ok || bad != 0 {
         return None;
     }
-    let [y0, y1, y2, y3, m0, m1, d0, d1, h0, h1, i0, i1, s0, s1] = digits.map(|d| d as i64);
-    let year = y0 * 1000 + y1 * 100 + y2 * 10 + y3;
-    let month = m0 * 10 + m1;
-    let day = d0 * 10 + d1;
-    let hour = h0 * 10 + h1;
-    let minute = i0 * 10 + i1;
-    let second = s0 * 10 + s1;
+    // Pairs of digits: byte i becomes 10 * d[i] + d[i + 1].
+    let pa = da.wrapping_mul(10).wrapping_add(da >> 8);
+    let pb = db.wrapping_mul(10).wrapping_add(db >> 8);
+    let year = (pa & 0xFF) as i64 * 100 + ((pa >> 16) & 0xFF) as i64;
+    let month = ((pa >> 40) & 0xFF) as i64;
+    let day = (pb & 0xFF) as i64;
+    let hour = ((pb >> 24) & 0xFF) as i64;
+    let minute = ((pb >> 48) & 0xFF) as i64;
+    let second = ((dc >> 8) & 0xFF) as i64 * 10 + ((dc >> 16) & 0xFF) as i64;
     if !(1..=12).contains(&month) || day < 1 || hour > 23 || minute > 59 || second > 59 {
         return None;
     }
@@ -220,5 +230,71 @@ mod tests {
         assert_eq!(parse_price(b"10000001"), None);
         assert_eq!(parse_price(b"19.99"), None);
         assert_eq!(parse_price(b"1000\r"), None);
+    }
+}
+
+#[cfg(test)]
+mod fuzz {
+    use super::*;
+
+    /// The SWAR parser agrees with a plain reference on random F1 strings,
+    /// valid and broken.
+    #[test]
+    fn f1_matches_reference() {
+        init();
+        fn reference(s: &[u8]) -> Option<i64> {
+            if s.len() != 20 || s[19] != b'Z' || s[4] != b'-' || s[7] != b'-' || s[10] != b'T' || s[13] != b':' || s[16] != b':' {
+                return None;
+            }
+            let num = |a: usize, n: usize| -> Option<i64> {
+                let mut v = 0i64;
+                for &c in &s[a..a + n] {
+                    if !c.is_ascii_digit() {
+                        return None;
+                    }
+                    v = v * 10 + (c - b'0') as i64;
+                }
+                Some(v)
+            };
+            let (y, mo, d, h, mi, se) = (num(0, 4)?, num(5, 2)?, num(8, 2)?, num(11, 2)?, num(14, 2)?, num(17, 2)?);
+            if !(1..=12).contains(&mo) || d < 1 || h > 23 || mi > 59 || se > 59 {
+                return None;
+            }
+            let dim = [31, if is_leap(y) { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][mo as usize - 1];
+            if d > dim {
+                return None;
+            }
+            Some(days_from_civil(y, mo, d) * DAY + ((h * 60 + mi) * 60 + se) * 1000)
+        }
+        let mut x: u64 = 0x1234_5678_9abc_def1;
+        let mut rnd = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let alphabet = b"0123456789-T:Z /\\x7fA\\x80";
+        for _ in 0..2_000_000 {
+            let mut s = *b"2028-02-29T23:59:59Z";
+            let r = rnd();
+            // Mostly valid-looking digits, with random corruption.
+            for i in 0..19 {
+                if s[i].is_ascii_digit() {
+                    s[i] = b'0' + (rnd() % 10) as u8;
+                }
+            }
+            if r % 3 == 0 {
+                let i = (rnd() % 20) as usize;
+                s[i] = alphabet[(rnd() % alphabet.len() as u64) as usize];
+            }
+            if r % 5 == 0 {
+                s[0] = b'2';
+                s[1] = b'0';
+                s[2] = b'2';
+                s[5] = b'0' + (rnd() % 2) as u8;
+                s[8] = b'0' + (rnd() % 4) as u8;
+            }
+            assert_eq!(parse_ts(&s), reference(&s), "{}", String::from_utf8_lossy(&s));
+        }
     }
 }

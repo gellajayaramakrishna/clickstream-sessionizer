@@ -17,21 +17,26 @@ What it handles:
 
 No engine and no JVM, just one native binary.
 
-1. **Memory-mapped input.** Files are split into ~2 MB chunks at line breaks and parsed
-   on all cores.
+1. **Parallel `pread` input.** Files are cut into 2 MB pieces; each thread reads its piece
+   into a reused buffer and keeps the lines that start inside it. No page-table churn,
+   and many reads in flight when the disk is cold.
 2. **SIMD CSV scanning.** AVX2 compares find commas, quotes and newlines 64 bytes at a
-   time; the dialect rules are applied while splitting.
+   time. Only commas and line ends are visited; quotes are validated once per line with
+   a counting rule instead of per character.
 3. **IDs as integers.** Every ID is packed into a `u64` (6 bits per character plus the
    length) in a way that keeps byte-wise order, so comparing, hashing and naming people
-   never touches strings. Odd IDs fall back to an interned table.
-4. **Two parallel shuffles.** Events are bucketed by event ID for dedup, then survivors
+   never touches strings. Packing runs 16 bytes at a time with SSE; odd IDs fall back to
+   an interned table.
+4. **SWAR timestamps.** `YYYY-MM-DDTHH:MM:SSZ` is validated and converted eight bytes at
+   a time, with month lengths from a precomputed table.
+5. **Two parallel shuffles.** Events are bucketed by event ID for dedup, then survivors
    and clicks are bucketed by person. Buckets live in one huge-page arena, filled through
    small per-thread staging buffers.
-5. **Union-find for linked IDs.** It runs on one thread while the others parse events.
+6. **Union-find for linked IDs.** It runs on one thread while the others parse events.
    Person lookups use a flat open-addressing table with batched prefetching.
-6. **Cache-friendly sessions.** Each bucket is grouped by person with a counting sort,
+7. **Cache-friendly sessions.** Each bucket is grouped by person with a counting sort,
    then each person's events are sorted by time and walked once.
-7. **Direct Parquet writer.** A small PLAIN, uncompressed writer encodes columns while
+8. **Direct Parquet writer.** A small PLAIN, uncompressed writer encodes columns while
    rows are produced.
 
 ## Run
@@ -53,6 +58,7 @@ docker run --rm --read-only --user 1000:1000 -e NCPU=8 \
 
 ## Tests
 
-`cargo test` covers the ID packing order, the CSV dialect and the timestamp rules.
+`cargo test` covers the ID packing order (scalar and SIMD), the CSV dialect, the input
+splitting and the timestamp rules, including a 2-million-case fuzz test of the fast parser.
 The pipeline passes all 36 edge-case fixtures of the track and matches the published
 1M-event dev answer exactly.

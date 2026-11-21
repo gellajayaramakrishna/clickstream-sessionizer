@@ -170,6 +170,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fast_matches_slow() {
+        let mut buf = Vec::new();
+        let ids: Vec<&[u8]> = vec![b"u1", b"e42huhoug", b"U8W84O3T0", b" u1", b"u1 ", b"c_1190", b"p13649", b"zzzzzzzzzz",
+            b"0", b"a", b"_", b"Z", b" ", b"u\t1", b"u1\r", b"\xd9\xa2", b"abcdefghijk", b"9y"];
+        for id in ids {
+            buf.clear();
+            buf.extend_from_slice(id);
+            buf.extend_from_slice(&[b'x'; 16]);
+            assert_eq!(pack_fast(&buf[..id.len()], true), pack(id), "{:?}", id);
+        }
+    }
+
+    #[test]
     fn order_and_roundtrip() {
         let ids: Vec<&[u8]> = vec![
             b"", b" ", b" u1", b"0", b"A", b"U1", b"_", b"a", b"u1", b"u1 ", b"u10", b"u2", b"zzzzzzzzzz",
@@ -183,4 +196,55 @@ mod tests {
             }
         }
     }
+}
+
+/// `pack` for an ID whose 16 bytes starting at `p` can be read (the ID is
+/// `len` bytes; the rest is ignored). Uses SIMD to map up to 10 characters
+/// to their codes at once; anything unusual goes to `pack`.
+#[inline(always)]
+pub fn pack_fast(b: &[u8], readable16: bool) -> Key {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        let n = b.len();
+        if readable16 && n <= MAXLEN {
+            unsafe {
+                use std::arch::x86_64::*;
+                let v = _mm_loadu_si128(b.as_ptr() as *const __m128i);
+                // Lanes past the end of the ID.
+                let idx = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+                let live = _mm_cmpgt_epi8(_mm_set1_epi8(n as i8), idx);
+                // Byte classes (all values here are below 0x80 when valid).
+                let ge = |c: u8| _mm_cmpgt_epi8(v, _mm_set1_epi8(c as i8 - 1));
+                let le = |c: u8| _mm_cmpgt_epi8(_mm_set1_epi8(c as i8 + 1), v);
+                let digit = _mm_and_si128(ge(b'0'), le(b'9'));
+                let upper = _mm_and_si128(ge(b'A'), le(b'Z'));
+                let lower = _mm_and_si128(ge(b'a'), le(b'z'));
+                let space = _mm_cmpeq_epi8(v, _mm_set1_epi8(b' ' as i8));
+                let under = _mm_cmpeq_epi8(v, _mm_set1_epi8(b'_' as i8));
+                let any = _mm_or_si128(_mm_or_si128(digit, upper), _mm_or_si128(lower, _mm_or_si128(space, under)));
+                let bad = _mm_andnot_si128(any, live);
+                if _mm_movemask_epi8(bad) == 0 {
+                    // code = byte - offset of its class.
+                    let off = _mm_or_si128(
+                        _mm_or_si128(_mm_and_si128(digit, _mm_set1_epi8(47)), _mm_and_si128(upper, _mm_set1_epi8(54))),
+                        _mm_or_si128(
+                            _mm_and_si128(lower, _mm_set1_epi8(59)),
+                            _mm_or_si128(_mm_and_si128(space, _mm_set1_epi8(32)), _mm_and_si128(under, _mm_set1_epi8(58))),
+                        ),
+                    );
+                    let codes = _mm_and_si128(_mm_sub_epi8(v, off), live);
+                    // Pairs -> 12 bits, quads -> 24 bits, first character highest.
+                    let pairs = _mm_maddubs_epi16(codes, _mm_set1_epi16(0x0140));
+                    let quads = _mm_madd_epi16(pairs, _mm_set1_epi32(0x0001_1000));
+                    let q0 = _mm_cvtsi128_si32(quads) as u32 as u64;
+                    let q1 = _mm_extract_epi32(quads, 1) as u32 as u64;
+                    let q2 = _mm_extract_epi32(quads, 2) as u32 as u64;
+                    let v60 = (q0 << 36) | (q1 << 12) | (q2 >> 12);
+                    return (v60 << 4) | n as u64;
+                }
+            }
+        }
+    }
+    let _ = readable16;
+    pack(b)
 }

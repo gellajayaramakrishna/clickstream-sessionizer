@@ -11,6 +11,7 @@
 //!   4. per person bucket: sessionize, attribute, aggregate, write Parquet
 
 mod csv;
+mod input;
 mod key;
 mod out;
 mod people;
@@ -22,10 +23,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use hashbrown::HashMap;
-use memmap2::Mmap;
 
 use crate::csv::scan;
-use crate::key::{hash_key, key_cmp, pack, Key, KeyBuild};
+use crate::input::{load, Input, Piece};
+use crate::key::{hash_key, key_cmp, pack, pack_fast, Key, KeyBuild};
 use crate::people::People;
 use crate::shuffle::Shuffle;
 use crate::ts::{parse_price, parse_ts, DAY};
@@ -86,55 +87,11 @@ fn bucket_of(k: Key) -> usize {
     (hash_key(k) >> 40) as usize & (BUCKETS - 1)
 }
 
-fn list_csv(dir: &Path) -> Vec<PathBuf> {
-    let mut v = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.extension().map(|x| x == "csv").unwrap_or(false) && p.is_file() {
-                v.push(p);
-            }
-        }
-    }
-    v.sort();
-    v
-}
-
-fn map_file(p: &Path) -> Option<Mmap> {
-    let f = std::fs::File::open(p).ok()?;
-    let len = f.metadata().ok()?.len();
-    if len == 0 {
-        return None;
-    }
-    let m = unsafe { Mmap::map(&f) }.ok()?;
-    #[cfg(unix)]
-    {
-        let _ = m.advise(memmap2::Advice::Sequential);
-    }
-    Some(m)
-}
-
 /// The data rows of a file (everything after the header line).
 fn body(m: &[u8]) -> &[u8] {
     match memchr::memchr(b'\n', m) {
         Some(i) => &m[i + 1..],
         None => &[],
-    }
-}
-
-/// Splits a body into pieces of about CHUNK bytes that end at a line break.
-fn chunks<'a>(b: &'a [u8], out: &mut Vec<&'a [u8]>) {
-    let mut start = 0;
-    while start < b.len() {
-        let mut end = (start + CHUNK).min(b.len());
-        if end < b.len() {
-            match memchr::memchr(b'\n', &b[end..]) {
-                Some(i) => end += i + 1,
-                None => end = b.len(),
-            }
-        }
-        out.push(&b[start..end]);
-        start = end;
     }
 }
 
@@ -285,11 +242,12 @@ fn load_small(data: &Path) -> Small {
 
 
 #[inline(always)]
-fn parse_event(f: &[&[u8]; 7], sm: &Small) -> Option<Ev> {
+fn parse_event(f: &[&[u8]; 7], sm: &Small, lim: usize) -> Option<Ev> {
     if f[0].is_empty() {
         return None;
     }
-    let eid = pack(f[0]);
+    let ok16 = |x: &[u8]| x.as_ptr() as usize + 16 <= lim;
+    let eid = pack_fast(f[0], ok16(f[0]));
     let ingest = parse_ts(f[3]).unwrap_or(i64::MAX / 2);
     let ingest_rel = (ingest - sm.base).div_euclid(1000).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
     let mut ev = Ev { eid, user: 0, ingest: ingest_rel, ts: 0, pt: 0, cat: 0 };
@@ -318,14 +276,15 @@ fn parse_event(f: &[&[u8]; 7], sm: &Small) -> Option<Ev> {
         }
         ev.cat = *sm.product_cat.get(&pack(f[5])).unwrap_or(&sm.unknown_cat);
     }
-    ev.user = pack(user);
+    ev.user = pack_fast(user, ok16(user));
     ev.ts = (ts - sm.base) as u32;
     ev.pt = price | (typ as u32) << 24;
     Some(ev)
 }
 
 #[inline(always)]
-fn parse_click(f: &[&[u8]; 4], sm: &Small) -> Option<Ck> {
+fn parse_click(f: &[&[u8]; 4], sm: &Small, lim: usize) -> Option<Ck> {
+    let ok16 = |x: &[u8]| x.as_ptr() as usize + 16 <= lim;
     if f[0].is_empty() || f[1].is_empty() {
         return None;
     }
@@ -333,8 +292,8 @@ fn parse_click(f: &[&[u8]; 4], sm: &Small) -> Option<Ck> {
     if ts < sm.ws - WEEK || ts >= sm.we {
         return None;
     }
-    let camp = *sm.camp_index.get(&pack(f[2]))?;
-    Some(Ck { person: pack(f[1]), cid: pack(f[0]), ts: (ts - sm.base) as u32, camp })
+    let camp = *sm.camp_index.get(&pack_fast(f[2], ok16(f[2])))?;
+    Some(Ck { person: pack_fast(f[1], ok16(f[1])), cid: pack_fast(f[0], ok16(f[0])), ts: (ts - sm.base) as u32, camp })
 }
 
 fn main() {
@@ -356,26 +315,26 @@ fn main() {
 
     ts::init();
     let sm = load_small(&data);
-    let link_maps: Vec<Mmap> = list_csv(&data.join("links")).iter().filter_map(|p| map_file(p)).collect();
-    let event_maps: Vec<Mmap> = list_csv(&data.join("events")).iter().filter_map(|p| map_file(p)).collect();
-    let click_maps: Vec<Mmap> = list_csv(&data.join("clicks")).iter().filter_map(|p| map_file(p)).collect();
+    let links_in = Input::open(&data.join("links"));
+    let events_in = Input::open(&data.join("events"));
+    let clicks_in = Input::open(&data.join("clicks"));
     mark("small");
 
     // ---- links: parse in parallel ----
-    let mut link_chunks = Vec::new();
-    for m in &link_maps {
-        chunks(body(m), &mut link_chunks);
-    }
+    let mut link_chunks: Vec<Piece> = Vec::new();
+    links_in.pieces(CHUNK as u64, &mut link_chunks);
     let next = AtomicUsize::new(0);
     let link_parts: Vec<Mutex<Vec<(Key, Key)>>> = (0..threads).map(|_| Mutex::new(Vec::new())).collect();
     run_parallel(threads, |t| {
         let mut local = Vec::new();
+        let mut buf = Vec::new();
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
             if i >= link_chunks.len() {
                 break;
             }
-            scan::<2, _>(link_chunks[i], |f| {
+            let (a, b) = load(&links_in, link_chunks[i], &mut buf);
+            scan::<2, _>(&buf[a..b], |f| {
                 if !f[0].is_empty() && !f[1].is_empty() {
                     local.push((pack(f[0]), pack(f[1])));
                 }
@@ -387,22 +346,16 @@ fn main() {
     mark("links parsed");
 
     // ---- events and clicks; thread 0 first joins the links into people ----
-    let mut work: Vec<(bool, &[u8])> = Vec::new();
-    let (mut event_bytes, mut click_bytes) = (0usize, 0usize);
+    let mut work: Vec<(bool, Piece)> = Vec::new();
+    let event_bytes = events_in.bytes() as usize;
+    let click_bytes = clicks_in.bytes() as usize;
     {
         let mut tmp = Vec::new();
-        for m in &event_maps {
-            event_bytes += m.len();
-            chunks(body(m), &mut tmp);
-        }
-        work.extend(tmp.drain(..).map(|c| (true, c)));
-        for m in &click_maps {
-            click_bytes += m.len();
-            chunks(body(m), &mut tmp);
-        }
-        work.extend(tmp.drain(..).map(|c| (false, c)));
+        events_in.pieces(CHUNK as u64, &mut tmp);
+        work.extend(tmp.drain(..).map(|p| (true, p)));
+        clicks_in.pieces(CHUNK as u64, &mut tmp);
+        work.extend(tmp.drain(..).map(|p| (false, p)));
     }
-    work.sort_by_key(|w| std::cmp::Reverse(w.1.len()));
     let ev_shuffle: Shuffle<Ev> = Shuffle::new(event_bytes / 64 + 1024, BUCKETS);
     let people_cell: OnceLock<People> = OnceLock::new();
     let link_parts = Mutex::new(Some(link_parts));
@@ -416,21 +369,27 @@ fn main() {
         }
         let mut w = ev_shuffle.writer();
         let mut clicks: Vec<Ck> = Vec::new();
+        let mut buf: Vec<u8> = Vec::with_capacity(CHUNK + (128 << 10));
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
             if i >= work.len() {
                 break;
             }
-            let (is_event, chunk) = work[i];
+            let (is_event, piece) = work[i];
+            let (a, b) = load(if is_event { &events_in } else { &clicks_in }, piece, &mut buf);
+            let chunk = &buf[a..b];
+            // The buffer keeps zero padding after the data, so 16-byte loads
+            // past any field stay inside it.
+            let lim = buf.as_ptr() as usize + buf.len();
             if is_event {
                 scan::<7, _>(chunk, |f| {
-                    if let Some(ev) = parse_event(f, &sm) {
+                    if let Some(ev) = parse_event(f, &sm, lim) {
                         w.push(bucket_of(ev.eid), ev);
                     }
                 });
             } else {
                 scan::<4, _>(chunk, |f| {
-                    if let Some(c) = parse_click(f, &sm) {
+                    if let Some(c) = parse_click(f, &sm, lim) {
                         clicks.push(c);
                     }
                 });
