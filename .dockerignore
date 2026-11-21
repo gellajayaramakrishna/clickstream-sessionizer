@@ -1,0 +1,6 @@
+target/
+*.parquet
+dev/
+data/
+out/
+.git/

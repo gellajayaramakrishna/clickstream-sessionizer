@@ -1,0 +1,18 @@
+[package]
+name = "clickstream-sessionizer"
+description = "Cleans click-stream logs, links user IDs, builds sessions and attributes campaigns into daily Parquet tables."
+license = "MIT"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+hashbrown = "0.17.1"
+memchr = "2.8.3"
+memmap2 = "0.9.12"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
