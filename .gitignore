@@ -3,3 +3,4 @@
 /data
 /out
 *.parquet
+.DS_Store
