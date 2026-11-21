@@ -298,3 +298,96 @@ mod fuzz {
         }
     }
 }
+
+/// `parse_ts` for a field followed by at least 16 readable bytes: digit-only
+/// values (F3) up to 16 digits are converted with SIMD.
+#[inline(always)]
+pub fn parse_ts_fast(s: &[u8], readable16: bool) -> Option<i64> {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        let n = s.len();
+        if readable16 && (1..=16).contains(&n) && n != 20 {
+            if let Some(v) = digits16(s) {
+                return Some(v);
+            }
+            // Not all digits: one of the other forms, or bad.
+            if n < 20 {
+                return None;
+            }
+        }
+    }
+    parse_ts(s)
+}
+
+/// Up to 16 ASCII digits at `s` (16 bytes readable) as a number.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn digits16(s: &[u8]) -> Option<i64> {
+    use std::arch::x86_64::*;
+    static SHIFT: [[i8; 16]; 17] = {
+        // For length L, lane j takes input byte j - (16 - L), or zero.
+        let mut t = [[-128i8; 16]; 17];
+        let mut l = 0;
+        while l <= 16 {
+            let mut j = 16 - l;
+            while j < 16 {
+                t[l][j] = (j - (16 - l)) as i8;
+                j += 1;
+            }
+            l += 1;
+        }
+        t
+    };
+    let n = s.len();
+    unsafe {
+        let raw = _mm_loadu_si128(s.as_ptr() as *const __m128i);
+        let d = _mm_sub_epi8(raw, _mm_set1_epi8(b'0' as i8));
+        // Lanes past the end are ignored; every live lane must be 0..=9.
+        let idx = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+        let live = _mm_cmpgt_epi8(_mm_set1_epi8(n as i8), idx);
+        let over = _mm_cmpgt_epi8(_mm_max_epu8(d, _mm_set1_epi8(9)), _mm_set1_epi8(9));
+        let bad = _mm_or_si128(_mm_and_si128(over, live), _mm_and_si128(_mm_cmplt_epi8(d, _mm_setzero_si128()), live));
+        if _mm_movemask_epi8(bad) != 0 {
+            return None;
+        }
+        // Right-align the digits (leading zeros), then combine pairwise.
+        let x = _mm_shuffle_epi8(d, _mm_loadu_si128(SHIFT[n].as_ptr() as *const __m128i));
+        let p2 = _mm_maddubs_epi16(x, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1));
+        let p4 = _mm_madd_epi16(p2, _mm_setr_epi16(100, 1, 100, 1, 100, 1, 100, 1));
+        let p4 = _mm_packus_epi32(p4, p4);
+        let p8 = _mm_madd_epi16(p4, _mm_setr_epi16(10000, 1, 10000, 1, 10000, 1, 10000, 1));
+        let hi = _mm_cvtsi128_si32(p8) as u32 as i64;
+        let lo = _mm_extract_epi32(p8, 1) as u32 as i64;
+        Some(hi * 100_000_000 + lo)
+    }
+}
+
+#[cfg(test)]
+mod fast_tests {
+    use super::*;
+
+    #[test]
+    fn digits_match() {
+        init();
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        for _ in 0..500_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let len = (x % 18) as usize + 1;
+            let mut s: Vec<u8> = (0..len).map(|i| b'0' + ((x >> (i * 3)) % 10) as u8).collect();
+            if x % 7 == 0 {
+                let i = (x >> 40) as usize % len;
+                s[i] = [b'.', b'e', b'-', b'/', b':', 0xd9, b' '][(x >> 50) as usize % 7];
+            }
+            let mut padded = s.clone();
+            padded.extend_from_slice(&[b'7'; 16]);
+            assert_eq!(parse_ts_fast(&padded[..len], true), parse_ts(&s), "{:?}", String::from_utf8_lossy(&s));
+        }
+        for t in [&b"2026-10-03T23:58:10Z"[..], b"2026-10-03T19:58:10-04:00", b"1791071890000", b"0001791071890000", b""] {
+            let mut p = t.to_vec();
+            p.extend_from_slice(&[b'1'; 16]);
+            assert_eq!(parse_ts_fast(&p[..t.len()], true), parse_ts(t));
+        }
+    }
+}

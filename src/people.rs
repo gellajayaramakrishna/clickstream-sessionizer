@@ -10,7 +10,8 @@ pub struct People {
 
 impl People {
     pub fn new(pairs: &[(Key, Key)]) -> Self {
-        let size = (pairs.len() * 2).next_power_of_two().max(16);
+        // Load factor up to 0.75 keeps the table small enough to stay mostly in cache.
+        let size = (pairs.len() * 4 / 3 + 1).next_power_of_two().max(16);
         let mut mem = memmap2::MmapMut::map_anon(size * 16).expect("map people");
         #[cfg(target_os = "linux")]
         {

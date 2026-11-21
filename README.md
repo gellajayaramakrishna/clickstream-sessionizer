@@ -17,9 +17,9 @@ What it handles:
 
 No engine and no JVM, just one native binary.
 
-1. **Parallel `pread` input.** Files are cut into 2 MB pieces; each thread reads its piece
-   into a reused buffer and keeps the lines that start inside it. No page-table churn,
-   and many reads in flight when the disk is cold.
+1. **Mapped input, populated per piece.** Files are cut into 2 MB pieces; each thread asks
+   the kernel to map its piece's pages in one call (`MADV_POPULATE_READ`) and keeps the
+   lines that start inside it. No copy and no fault per page. `pread` is the fallback.
 2. **SIMD CSV scanning.** AVX2 compares find commas, quotes and newlines 64 bytes at a
    time. Only commas and line ends are visited; quotes are validated once per line with
    a counting rule instead of per character.
@@ -30,12 +30,14 @@ No engine and no JVM, just one native binary.
 4. **SWAR timestamps.** `YYYY-MM-DDTHH:MM:SSZ` is validated and converted eight bytes at
    a time, with month lengths from a precomputed table.
 5. **Two parallel shuffles.** Events are bucketed by event ID for dedup, then survivors
-   and clicks are bucketed by person. Buckets live in one huge-page arena, filled through
+   are bucketed by person. Clicks are parsed last, once people are known, and go straight
+   to their person's bucket. Buckets live in one huge-page arena, filled through
    small per-thread staging buffers.
 6. **Union-find for linked IDs.** It runs on one thread while the others parse events.
    Person lookups use a flat open-addressing table with batched prefetching.
-7. **Cache-friendly sessions.** Each bucket is grouped by person with a counting sort,
-   then each person's events are sorted by time and walked once.
+7. **Cache-friendly sessions.** Each person bucket is radix-partitioned into 2048 small
+   parts by more hash bits; each part is sorted by (person, time) inside L1, then walked
+   once for sessions, last-click credit and assists.
 8. **Direct Parquet writer.** A small PLAIN, uncompressed writer encodes columns while
    rows are produced.
 

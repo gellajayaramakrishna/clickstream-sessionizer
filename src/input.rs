@@ -1,10 +1,11 @@
-//! Reading the CSV files in pieces with `pread`.
+//! Reading the CSV files in pieces.
 //!
-//! Each file is cut into fixed byte ranges. A thread reads one range (plus a
-//! little more) into its own reusable buffer and keeps exactly the lines that
-//! start inside the range, so every line belongs to one piece. Compared with
-//! mapping the files, this avoids page-table work and lets every thread keep
-//! its own disk read in flight.
+//! Each file is cut into fixed byte ranges, and a piece keeps exactly the
+//! lines that start inside its range, so every line belongs to one piece.
+//! Files are mapped read-only and each thread asks the kernel to map its
+//! piece's pages in one call (MADV_POPULATE_READ), which avoids both a copy
+//! and a page fault per page. If mapping fails, pieces are read with `pread`
+//! into a reusable buffer instead.
 
 use std::fs::File;
 use std::os::unix::fs::FileExt;
@@ -17,6 +18,9 @@ pub const PAD: usize = 16;
 
 pub struct Input {
     pub files: Vec<(File, u64)>,
+    /// The files mapped read-only; empty if mapping failed, in which case
+    /// pieces are read with `pread` instead.
+    pub maps: Vec<memmap2::Mmap>,
 }
 
 #[derive(Clone, Copy)]
@@ -51,7 +55,39 @@ impl Input {
                 }
             }
         }
-        Input { files }
+        let maps: Vec<memmap2::Mmap> = files.iter().filter_map(|(f, _)| unsafe { memmap2::Mmap::map(f).ok() }).collect();
+        let maps = if maps.len() == files.len() { maps } else { Vec::new() };
+        Input { files, maps }
+    }
+
+    /// Like `load`, but returns the range inside the mapped file, after asking
+    /// the kernel to map that range in one call.
+    pub fn view(&self, p: Piece) -> (&[u8], usize, usize) {
+        let m: &[u8] = &self.maps[p.file as usize];
+        let flen = m.len();
+        let (start, end) = (p.start as usize, p.end as usize);
+        let from = start.saturating_sub(1);
+        let first = match memchr::memchr(b'\n', &m[from..]) {
+            Some(i) => from + i + 1,
+            None => return (m, 0, 0),
+        };
+        if first > end - 1 {
+            return (m, 0, 0);
+        }
+        let stop = if end >= flen {
+            flen
+        } else {
+            match memchr::memchr(b'\n', &m[end - 1..]) {
+                Some(j) => end - 1 + j + 1,
+                None => flen,
+            }
+        };
+        unsafe {
+            let a = (m.as_ptr() as usize + first) & !4095;
+            let b = m.as_ptr() as usize + stop;
+            libc::madvise(a as *mut libc::c_void, b - a, libc::MADV_POPULATE_READ);
+        }
+        (m, first, stop)
     }
 
     pub fn bytes(&self) -> u64 {

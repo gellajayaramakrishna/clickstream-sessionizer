@@ -96,6 +96,11 @@ fn pack_long(b: &[u8]) -> Key {
     (id << 4) | LONG
 }
 
+/// Whether any ID so far needed the interned table.
+pub fn any_long() -> bool {
+    !long_table().lock().unwrap().strings.is_empty()
+}
+
 #[inline(always)]
 pub fn is_long(k: Key) -> bool {
     (k & 15) == LONG

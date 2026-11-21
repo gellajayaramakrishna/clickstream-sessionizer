@@ -29,7 +29,7 @@ use crate::input::{load, Input, Piece};
 use crate::key::{hash_key, key_cmp, pack, pack_fast, Key, KeyBuild};
 use crate::people::People;
 use crate::shuffle::Shuffle;
-use crate::ts::{parse_price, parse_ts, DAY};
+use crate::ts::{parse_price, parse_ts, parse_ts_fast, DAY};
 
 const SESSION_GAP: i64 = 30 * 60 * 1000;
 const WEEK: i64 = 7 * DAY;
@@ -93,6 +93,20 @@ fn body(m: &[u8]) -> &[u8] {
         Some(i) => &m[i + 1..],
         None => &[],
     }
+}
+
+/// CPU time used by the calling thread, in seconds (for TIMING output).
+fn thread_cpu() -> f64 {
+    let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut t) };
+    t.tv_sec as f64 + t.tv_nsec as f64 * 1e-9
+}
+
+/// Per-stage CPU seconds summed over threads, for TIMING output.
+static CPU: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+fn add_cpu(stage: usize, secs: f64) {
+    CPU[stage].fetch_add((secs * 1e6) as u64, Ordering::Relaxed);
 }
 
 fn read_small(p: &Path) -> Vec<u8> {
@@ -241,6 +255,20 @@ fn load_small(data: &Path) -> Small {
 }
 
 
+/// `view`, `cart` or `purchase` exactly, as T_*; 0 for anything else.
+#[inline(always)]
+fn event_type(t: &[u8]) -> u8 {
+    match t.len() {
+        4 => match u32::from_le_bytes(t.try_into().unwrap()) {
+            x if x == u32::from_le_bytes(*b"view") => T_VIEW,
+            x if x == u32::from_le_bytes(*b"cart") => T_CART,
+            _ => 0,
+        },
+        8 if u64::from_le_bytes(t.try_into().unwrap()) == u64::from_le_bytes(*b"purchase") => T_PURCHASE,
+        _ => 0,
+    }
+}
+
 #[inline(always)]
 fn parse_event(f: &[&[u8]; 7], sm: &Small, lim: usize) -> Option<Ev> {
     if f[0].is_empty() {
@@ -255,13 +283,11 @@ fn parse_event(f: &[&[u8]; 7], sm: &Small, lim: usize) -> Option<Ev> {
     if user.is_empty() || f[5].is_empty() {
         return Some(ev);
     }
-    let typ = match f[4] {
-        b"view" => T_VIEW,
-        b"cart" => T_CART,
-        b"purchase" => T_PURCHASE,
-        _ => return Some(ev),
-    };
-    let ts = match parse_ts(f[2]) {
+    let typ = event_type(f[4]);
+    if typ == 0 {
+        return Some(ev);
+    }
+    let ts = match parse_ts_fast(f[2], ok16(f[2])) {
         Some(t) if t >= sm.ws && t < sm.we => t,
         _ => return Some(ev),
     };
@@ -288,7 +314,7 @@ fn parse_click(f: &[&[u8]; 4], sm: &Small, lim: usize) -> Option<Ck> {
     if f[0].is_empty() || f[1].is_empty() {
         return None;
     }
-    let ts = parse_ts(f[3])?;
+    let ts = parse_ts_fast(f[3], ok16(f[3]))?;
     if ts < sm.ws - WEEK || ts >= sm.we {
         return None;
     }
@@ -360,15 +386,19 @@ fn main() {
     let people_cell: OnceLock<People> = OnceLock::new();
     let link_parts = Mutex::new(Some(link_parts));
     let next = AtomicUsize::new(0);
-    let click_lists: Vec<Mutex<Vec<Ck>>> = (0..threads).map(|_| Mutex::new(Vec::new())).collect();
+    // Clicks are parsed last; by then the people are known, so each click goes
+    // straight into its person's bucket.
+    let ck_shuffle: Shuffle<Ck> = Shuffle::new(click_bytes / 40 + 1024, BUCKETS);
     run_parallel(threads, |t| {
         if t == 0 {
             let parts = link_parts.lock().unwrap().take().unwrap();
             let _ = people_cell.set(build_people(parts));
             mark("people (thread 0)");
         }
+        let c0 = thread_cpu();
         let mut w = ev_shuffle.writer();
-        let mut clicks: Vec<Ck> = Vec::new();
+        let mut cw = ck_shuffle.writer();
+        let mut pending: Vec<Ck> = Vec::with_capacity(64);
         let mut buf: Vec<u8> = Vec::with_capacity(CHUNK + (128 << 10));
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
@@ -376,11 +406,17 @@ fn main() {
                 break;
             }
             let (is_event, piece) = work[i];
-            let (a, b) = load(if is_event { &events_in } else { &clicks_in }, piece, &mut buf);
-            let chunk = &buf[a..b];
-            // The buffer keeps zero padding after the data, so 16-byte loads
-            // past any field stay inside it.
-            let lim = buf.as_ptr() as usize + buf.len();
+            let inp = if is_event { &events_in } else { &clicks_in };
+            let (chunk, lim): (&[u8], usize) = if inp.maps.is_empty() {
+                // Fallback: no mapping.
+                let (a, b) = load(inp, piece, &mut buf);
+                // The buffer keeps zero padding after the data, so 16-byte
+                // loads past any field stay inside it.
+                (&buf[a..b], buf.as_ptr() as usize + buf.len())
+            } else {
+                let (m, a, b) = inp.view(piece);
+                (&m[a..b], m.as_ptr() as usize + m.len())
+            };
             if is_event {
                 scan::<7, _>(chunk, |f| {
                     if let Some(ev) = parse_event(f, &sm, lim) {
@@ -388,38 +424,44 @@ fn main() {
                     }
                 });
             } else {
+                let people = people_cell.wait();
+                // Resolve people in small batches so the lookups can be
+                // prefetched.
+                let mut flush = |pending: &mut Vec<Ck>| {
+                    for c in pending.iter() {
+                        people.prefetch(c.person);
+                    }
+                    for c in pending.drain(..) {
+                        let mut c = c;
+                        c.person = people.get(c.person);
+                        cw.push(bucket_of(c.person), c);
+                    }
+                };
                 scan::<4, _>(chunk, |f| {
                     if let Some(c) = parse_click(f, &sm, lim) {
-                        clicks.push(c);
+                        pending.push(c);
+                        if pending.len() == 32 {
+                            flush(&mut pending);
+                        }
                     }
                 });
+                flush(&mut pending);
             }
         }
         w.finish();
-        *click_lists[t].lock().unwrap() = clicks;
+        cw.finish();
+        add_cpu(0, thread_cpu() - c0);
     });
     let people = people_cell.get().unwrap();
-    const BATCH: usize = 32;
+    // How far ahead person lookups are prefetched.
+    const AHEAD: usize = 24;
     mark("parse");
 
     // ---- dedup by event_id; bucket survivors and clicks by person ----
     let sv_shuffle: Shuffle<Sv> = Shuffle::new(event_bytes / 64 + 1024, BUCKETS);
-    let ck_shuffle: Shuffle<Ck> = Shuffle::new(click_bytes / 40 + 1024, BUCKETS);
     let next = AtomicUsize::new(0);
-    run_parallel(threads, |t| {
-        let mut cw = ck_shuffle.writer();
-        let list = std::mem::take(&mut *click_lists[t].lock().unwrap());
-        for batch in list.chunks(BATCH) {
-            for c in batch {
-                people.prefetch(c.person);
-            }
-            for c in batch {
-                let mut c = *c;
-                c.person = people.get(c.person);
-                cw.push(bucket_of(c.person), c);
-            }
-        }
-        cw.finish();
+    run_parallel(threads, |_t| {
+        let c0 = thread_cpu();
         let mut winners: Vec<u32> = Vec::new();
         let mut win: Vec<u64> = Vec::new();
         let mut w = sv_shuffle.writer();
@@ -465,23 +507,23 @@ fn main() {
                     }
                 }
             }
-            for batch in winners.chunks(BATCH) {
-                for &i in batch {
-                    people.prefetch(get(i as usize).user);
+            for (k, &i) in winners.iter().enumerate() {
+                if let Some(&a) = winners.get(k + AHEAD) {
+                    people.prefetch(get(a as usize).user);
                 }
-                for &i in batch {
-                    let ev = get(i as usize);
-                    let person = people.get(ev.user);
-                    w.push(bucket_of(person), Sv { person, ts: ev.ts, pt: ev.pt, cat: ev.cat });
-                }
+                let ev = get(i as usize);
+                let person = people.get(ev.user);
+                w.push(bucket_of(person), Sv { person, ts: ev.ts, pt: ev.pt, cat: ev.cat });
             }
         }
         w.finish();
+        add_cpu(1, thread_cpu() - c0);
     });
     drop(ev_shuffle);
     mark("dedup");
 
     // ---- sessions, attribution, aggregation ----
+    let any_long = key::any_long();
     let day0 = sm.ws.div_euclid(DAY);
     let ndays = ((sm.we - 1).div_euclid(DAY) - day0 + 1).max(1) as usize;
     let ncamp = sm.camp_ids.len();
@@ -493,6 +535,7 @@ fn main() {
     let next = AtomicUsize::new(0);
     let camp_aggs: Vec<Mutex<CampAgg>> = (0..threads).map(|_| Mutex::new(Vec::new())).collect();
     run_parallel(threads, |t| {
+        let c0 = thread_cpu();
         let mut agg: CampAgg = vec![[0; 4]; (ncamp + 1) * ndays];
         let mut stamp: Vec<u64> = vec![0; ncamp + 1];
         let mut stamp_gen: u64 = 0;
@@ -500,81 +543,50 @@ fn main() {
         let mut evs: Vec<Sv> = Vec::new();
         let mut cks: Vec<Ck> = Vec::new();
         let mut day_cats: Vec<(u16, i64)> = Vec::new();
-        let mut local: HashMap<Key, u32, KeyBuild> = HashMap::with_hasher(KeyBuild);
-        let mut persons: Vec<(Key, u32)> = Vec::new();
-        let mut slot: Vec<u32> = Vec::new();
-        let mut order: Vec<u32> = Vec::new();
-        let mut starts: Vec<u32> = Vec::new();
+        let mut ev_starts: Vec<u32> = Vec::new();
+        let mut ck_starts: Vec<u32> = Vec::new();
         loop {
             let b = next.fetch_add(1, Ordering::Relaxed);
             if b >= BUCKETS {
                 break;
             }
-            // Group this bucket's events by person (counting sort on a local
-            // person number), then sort each person's events by time.
+            // Radix-partition this bucket's events and clicks by a few hash
+            // bits of the person, then sort each small part by (person, ts).
+            // Within every part, persons come out in key order for both.
             let (m, x) = sv_shuffle.bucket(b);
-            let n = m.len() + x.len();
-            let src = |i: usize| -> &Sv { if i < m.len() { &m[i] } else { &x[i - m.len()] } };
-            local.clear();
-            persons.clear();
-            slot.clear();
-            slot.reserve(n);
-            for i in 0..n {
-                let p = src(i).person;
-                let id = *local.entry(p).or_insert_with(|| {
-                    persons.push((p, 0u32));
-                    (persons.len() - 1) as u32
-                });
-                persons[id as usize].1 += 1;
-                slot.push(id);
-            }
-            // Order persons by key so clicks can be merged in the same order.
-            order.clear();
-            order.extend(0..persons.len() as u32);
-            order.sort_unstable_by_key(|&id| persons[id as usize].0);
-            starts.clear();
-            starts.resize(persons.len() + 1, 0);
-            let mut acc = 0u32;
-            for &id in &order {
-                starts[id as usize] = acc;
-                acc += persons[id as usize].1;
-            }
-            evs.clear();
-            evs.reserve(n);
-            unsafe { evs.set_len(n) };
-            {
-                let mut fill = starts.clone();
-                for i in 0..n {
-                    let id = slot[i] as usize;
-                    evs[fill[id] as usize] = *src(i);
-                    fill[id] += 1;
-                }
-            }
-            for &id in &order {
-                let a = starts[id as usize] as usize;
-                let len = persons[id as usize].1 as usize;
-                let g = &mut evs[a..a + len];
-                if len > 1 {
-                    if len <= 24 {
-                        for q in 1..len {
-                            let mut r = q;
-                            while r > 0 && g[r - 1].ts > g[r].ts {
-                                g.swap(r - 1, r);
-                                r -= 1;
-                            }
-                        }
-                    } else {
-                        g.sort_unstable_by_key(|e| e.ts);
-                    }
-                }
-            }
-            cks.clear();
+            radix_parts(m, &x, |e| e.person, &mut evs, &mut ev_starts);
             let (m, x) = ck_shuffle.bucket(b);
-            cks.extend_from_slice(m);
-            cks.extend_from_slice(&x);
-            cks.sort_unstable_by(|a, b| {
-                a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)).then_with(|| key_cmp(a.cid, b.cid))
-            });
+            radix_parts(m, &x, |c| c.person, &mut cks, &mut ck_starts);
+            for p in 0..SUB {
+                let g = &mut evs[ev_starts[p] as usize..ev_starts[p + 1] as usize];
+                if g.len() <= 24 {
+                    for q in 1..g.len() {
+                        let mut r = q;
+                        while r > 0 && (g[r - 1].person, g[r - 1].ts) > (g[r].person, g[r].ts) {
+                            g.swap(r - 1, r);
+                            r -= 1;
+                        }
+                    }
+                } else {
+                    g.sort_unstable_by_key(|e| ((e.person as u128) << 32) | e.ts as u128);
+                }
+                let g = &mut cks[ck_starts[p] as usize..ck_starts[p + 1] as usize];
+                if any_long {
+                    g.sort_unstable_by(|a, b| {
+                        a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)).then_with(|| key_cmp(a.cid, b.cid))
+                    });
+                } else if g.len() <= 24 {
+                    for q in 1..g.len() {
+                        let mut r = q;
+                        while r > 0 && (g[r - 1].person, g[r - 1].ts, g[r - 1].cid) > (g[r].person, g[r].ts, g[r].cid) {
+                            g.swap(r - 1, r);
+                            r -= 1;
+                        }
+                    }
+                } else {
+                    g.sort_unstable_by_key(|c| (c.person, c.ts, c.cid));
+                }
+            }
             let mut ci = 0usize;
             let mut i = 0usize;
             while i < evs.len() {
@@ -583,7 +595,8 @@ fn main() {
                 while j < evs.len() && evs[j].person == person {
                     j += 1;
                 }
-                while ci < cks.len() && cks[ci].person < person {
+                let part = sub_of(person);
+                while ci < cks.len() && (sub_of(cks[ci].person), cks[ci].person) < (part, person) {
                     ci += 1;
                 }
                 let mut cj = ci;
@@ -666,9 +679,12 @@ fn main() {
                 i = j;
             }
         }
+        add_cpu(2, thread_cpu() - c0);
+        let c1 = thread_cpu();
         if !rows.is_empty() || t == 0 {
             rows.write(&ud_dir.join(format!("part-{t:03}.parquet")));
         }
+        add_cpu(3, thread_cpu() - c1);
         *camp_aggs[t].lock().unwrap() = agg;
     });
     mark("sessions+write");
@@ -695,7 +711,46 @@ fn main() {
     }
     crow.write(&cd_dir.join("part-000.parquet"));
     mark("done");
+    if timing {
+        let c: Vec<f64> = CPU.iter().map(|x| x.load(Ordering::Relaxed) as f64 / 1e6).collect();
+        eprintln!("cpu s: parse {:.3} dedup {:.3} sessions {:.3} write {:.3}", c[0], c[1], c[2], c[3]);
+    }
     std::process::exit(0);
+}
+
+/// Parts per person bucket in the sessions stage.
+const SUB: usize = 2048;
+
+/// The part of a person within its bucket (hash bits not used by bucket_of).
+#[inline(always)]
+fn sub_of(k: Key) -> usize {
+    hash_key(k) as usize & (SUB - 1)
+}
+
+/// Counting sort of `main` + `extra` into `out` by `sub_of(key(x))`;
+/// `starts[p]..starts[p + 1]` is part p.
+fn radix_parts<T: Copy, F: Fn(&T) -> Key>(main: &[T], extra: &[T], key: F, out: &mut Vec<T>, starts: &mut Vec<u32>) {
+    let n = main.len() + extra.len();
+    starts.clear();
+    starts.resize(SUB + 1, 0);
+    for x in main.iter().chain(extra.iter()) {
+        starts[sub_of(key(x)) + 1] += 1;
+    }
+    for p in 0..SUB {
+        starts[p + 1] += starts[p];
+    }
+    out.clear();
+    out.reserve(n);
+    let mut fill: Vec<u32> = starts[..SUB].to_vec();
+    unsafe {
+        let o = out.as_mut_ptr();
+        for x in main.iter().chain(extra.iter()) {
+            let p = sub_of(key(x));
+            o.add(fill[p] as usize).write(*x);
+            fill[p] += 1;
+        }
+        out.set_len(n);
+    }
 }
 
 /// The category with the highest summed price; ties go to the smallest name,
