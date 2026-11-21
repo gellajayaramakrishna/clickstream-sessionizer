@@ -1,0 +1,6 @@
+/target
+/dev
+/data
+/out
+*.parquet
+.DS_Store
