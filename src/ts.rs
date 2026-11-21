@@ -1,6 +1,5 @@
 //! Timestamp and price parsing, ASCII digits only.
 
-use std::sync::OnceLock;
 
 pub const DAY: i64 = 86_400_000;
 
@@ -20,38 +19,48 @@ fn is_leap(year: i64) -> bool {
 const Y0: i64 = 1900;
 const YEARS: usize = 300;
 
-/// Days since the epoch of the first of each month, and the month's length,
-/// for the years 1900 to 2199.
-struct Months {
-    first: Vec<i32>,
-    len: Vec<u8>,
+const fn civil_days(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let yoe = year - era * 400;
+    let doy = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468
 }
 
-fn months() -> &'static Months {
-    static M: OnceLock<Months> = OnceLock::new();
-    M.get_or_init(|| {
-        let mut first = Vec::with_capacity(YEARS * 12);
-        let mut len = Vec::with_capacity(YEARS * 12);
-        for y in 0..YEARS as i64 {
-            for m in 1..=12 {
-                first.push(days_from_civil(Y0 + y, m, 1) as i32);
-                len.push(match m {
-                    1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-                    4 | 6 | 9 | 11 => 30,
-                    _ => {
-                        if is_leap(Y0 + y) { 29 } else { 28 }
-                    }
-                });
+const fn leap(year: i64) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+}
+
+/// For each month of the years 1900 to 2199: days since the epoch of its
+/// first day, and its length. Built at compile time.
+static MONTH_FIRST: [i32; YEARS * 12] = {
+    let mut t = [0i32; YEARS * 12];
+    let mut i = 0;
+    while i < YEARS * 12 {
+        t[i] = civil_days(Y0 + (i / 12) as i64, (i % 12) as i64 + 1, 1) as i32;
+        i += 1;
+    }
+    t
+};
+static MONTH_LEN: [u8; YEARS * 12] = {
+    let mut t = [0u8; YEARS * 12];
+    let mut i = 0;
+    while i < YEARS * 12 {
+        let m = i % 12 + 1;
+        t[i] = match m {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            _ => {
+                if leap(Y0 + (i / 12) as i64) { 29 } else { 28 }
             }
-        }
-        Months { first, len }
-    })
-}
+        };
+        i += 1;
+    }
+    t
+};
 
-/// Must be called once before parsing on many threads.
-pub fn init() {
-    let _ = months();
-}
+/// Kept for callers that initialise explicitly; the tables are static now.
+pub fn init() {}
 
 #[inline]
 fn slow_days(year: i64, month: i64, day: i64) -> Option<i64> {
@@ -101,17 +110,18 @@ fn civil_ms(s: &[u8]) -> Option<i64> {
         return None;
     }
     let days = if (Y0..Y0 + YEARS as i64).contains(&year) {
-        let mt = months();
         let idx = ((year - Y0) * 12 + month - 1) as usize;
-        if day > mt.len[idx] as i64 {
+        // idx < YEARS * 12 by the range checks above.
+        if day > (unsafe { *MONTH_LEN.get_unchecked(idx) }) as i64 {
             return None;
         }
-        mt.first[idx] as i64 + day - 1
+        (unsafe { *MONTH_FIRST.get_unchecked(idx) }) as i64 + day - 1
     } else {
         slow_days(year, month, day)?
     };
-    Some(days * DAY + ((hour * 60 + minute) * 60 + second) * 1000)
+    Some((days * 86_400 + (hour * 60 + minute) * 60 + second) * 1000)
 }
+
 
 /// Parses F1, F2 or F3 into epoch milliseconds. None for anything else,
 /// including an F3 value too large for i64 (it is outside any window).

@@ -9,24 +9,38 @@ pub struct People {
 }
 
 impl People {
-    pub fn new(pairs: &[(Key, Key)]) -> Self {
-        // Load factor up to 0.75 keeps the table small enough to stay mostly in cache.
-        let size = (pairs.len() * 4 / 3 + 1).next_power_of_two().max(16);
-        let mut mem = memmap2::MmapMut::map_anon(size * 16).expect("map people");
+    /// An empty table for up to `n` entries, filled with `insert` from many
+    /// threads at once.
+    pub fn with_capacity(n: usize) -> Self {
+        let size = (n * 4 / 3 + 1).next_power_of_two().max(16);
+        let mem = memmap2::MmapMut::map_anon(size * 16).expect("map people");
         #[cfg(target_os = "linux")]
         {
             let _ = mem.advise(memmap2::Advice::HugePage);
         }
-        let slots: &mut [[Key; 2]] = unsafe { std::slice::from_raw_parts_mut(mem.as_mut_ptr() as *mut [Key; 2], size) };
-        let mask = size - 1;
-        for &(k, v) in pairs {
-            let mut i = hash_key(k) as usize & mask;
-            while slots[i][0] != 0 && slots[i][0] != k {
-                i = (i + 1) & mask;
+        People { mem, mask: size - 1 }
+    }
+
+    /// Adds `k -> v`; safe to call from many threads for distinct keys.
+    /// Lookups may only start after all inserts are done.
+    pub fn insert(&self, k: Key, v: Key) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let base = self.mem.as_ptr() as *const [AtomicU64; 2];
+        let mut i = hash_key(k) as usize & self.mask;
+        loop {
+            let slot = unsafe { &*base.add(i) };
+            match slot[0].compare_exchange(0, k, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => {
+                    slot[1].store(v, Ordering::Release);
+                    return;
+                }
+                Err(cur) if cur == k => {
+                    slot[1].store(v, Ordering::Release);
+                    return;
+                }
+                Err(_) => i = (i + 1) & self.mask,
             }
-            slots[i] = [k, v];
         }
-        People { mem, mask }
     }
 
     #[inline(always)]
@@ -34,6 +48,7 @@ impl People {
         self.mem.as_ptr() as *const [Key; 2]
     }
 
+    #[inline(always)]
     pub fn prefetch(&self, k: Key) {
         let i = hash_key(k) as usize & self.mask;
         #[cfg(target_arch = "x86_64")]

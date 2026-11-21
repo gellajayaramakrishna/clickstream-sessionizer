@@ -11,9 +11,43 @@
 /// Most fields a line may have.
 const MAXF: usize = 8;
 
+/// Whether the CPU can compare 64 bytes at once (AVX-512 BW). Checked once.
+pub fn init() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx512bw") {
+            AVX512.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+static AVX512: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The three masks with one AVX-512 compare each.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw")]
+unsafe fn masks512(block: &[u8; 64]) -> (u64, u64, u64) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let v = _mm512_loadu_si512(block.as_ptr() as *const _);
+        (
+            _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b',' as i8)),
+            _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'"' as i8)),
+            _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\n' as i8)),
+        )
+    }
+}
+
 /// Bit masks of `,` and `"` and `\n` in a 64-byte block.
 #[inline(always)]
-fn masks(block: &[u8; 64]) -> (u64, u64, u64) {
+fn masks(block: &[u8; 64], wide: bool) -> (u64, u64, u64) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if wide {
+            return unsafe { masks512(block) };
+        }
+    }
+    let _ = wide;
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     unsafe {
         use std::arch::x86_64::*;
@@ -78,6 +112,7 @@ pub fn scan<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(chunk: &'a [u8], mut f
     let mut line_start = 0usize;
     let mut base = 0usize;
     let mut tail: [u8; 64];
+    let wide = AVX512.load(std::sync::atomic::Ordering::Relaxed);
     while base < n {
         let block: &[u8; 64] = if base + 64 <= n {
             unsafe { &*(ptr.add(base) as *const [u8; 64]) }
@@ -86,7 +121,7 @@ pub fn scan<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(chunk: &'a [u8], mut f
             tail[..n - base].copy_from_slice(&chunk[base..]);
             &tail
         };
-        let (comma, quote, nl) = masks(block);
+        let (comma, quote, nl) = masks(block, wide);
         let mut bits = comma | nl;
         while bits != 0 {
             let i = bits.trailing_zeros();
