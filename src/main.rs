@@ -31,25 +31,49 @@ fn fmix(mut k: u64) -> u64 {
 }
 
 #[inline(always)]
+fn mum(a: u64, b: u64) -> u64 {
+    let r = (a as u128).wrapping_mul(b as u128);
+    (r as u64) ^ ((r >> 64) as u64)
+}
+
+#[inline(always)]
+fn rd8(b: &[u8], i: usize) -> u64 {
+    u64::from_le_bytes(unsafe { *(b.as_ptr().add(i) as *const [u8; 8]) })
+}
+
+#[inline(always)]
+fn rd_tail(b: &[u8], i: usize, n: usize) -> u64 {
+    let mut w: u64 = 0;
+    let mut k = 0;
+    while i + k < n && k < 8 {
+        w |= (b[i + k] as u64) << (8 * k);
+        k += 1;
+    }
+    w
+}
+
+const S0: u64 = 0xa0761d6478bd642f;
+const S1: u64 = 0xe7037ed1a0b428db;
+const S2: u64 = 0x8ebc6af09c88c6e3;
+const S3: u64 = 0x589965cc75374cc3;
+
+/// Strong 64-bit hash (wyhash-style 128-bit multiply mixing).
+#[inline(always)]
 fn hash_bytes(b: &[u8]) -> u64 {
     let n = b.len();
-    let mut h: u64 = 0x9E3779B97F4A7C15 ^ (n as u64).wrapping_mul(0xff51afd7ed558ccd);
+    let mut h: u64 = S0 ^ mum(n as u64 ^ S1, S2);
     let mut i = 0;
-    while i + 8 <= n {
-        let w = u64::from_le_bytes(unsafe { *(b.as_ptr().add(i) as *const [u8; 8]) });
-        h = (h ^ w).wrapping_mul(0x9FB21C651E98DF25).rotate_left(29);
-        i += 8;
+    while i + 16 <= n {
+        h = mum(rd8(b, i) ^ S1 ^ h, rd8(b, i + 8) ^ S2);
+        i += 16;
     }
-    if i < n {
-        let mut w: u64 = 0;
-        let mut s = 0;
-        while i < n {
-            w |= (b[i] as u64) << s;
-            s += 8;
-            i += 1;
-        }
-        h = (h ^ w).wrapping_mul(0x9FB21C651E98DF25).rotate_left(29);
-    }
+    let (x, y) = if i + 8 <= n {
+        (rd8(b, i), rd_tail(b, i + 8, n))
+    } else {
+        (rd_tail(b, i, n), 0)
+    };
+    h = mum(x ^ S1 ^ h, y ^ S3);
+    h = mum(h ^ S0, (n as u64) ^ S3);
     let h = fmix(h);
     if h == 0 { 1 } else { h }
 }
@@ -386,6 +410,7 @@ fn parse_price(b: &[u8]) -> Option<u32> {
 #[repr(C)]
 struct ERec {
     eid: u64,
+    eref: u64,
     ingest: i64,
     ts: i64,
     user: u64,
@@ -745,7 +770,7 @@ fn parse_events(c: &Chunk, ctx: &Ctx, out: &mut Vec<Vec<ERec>>) {
         }
         let eh = hash_bytes(eid);
         let ingest = parse_ts(f[3]).unwrap_or(i64::MAX);
-        let mut r = ERec { eid: eh, ingest, ts: 0, user: 0, uref: 0, price: 0, cat: 0, typ: 0, valid: 0 };
+        let mut r = ERec { eid: eh, eref: pack(eid), ingest, ts: 0, user: 0, uref: 0, price: 0, cat: 0, typ: 0, valid: 0 };
         'v: {
             let user = f[1];
             if user.is_empty() || f[5].is_empty() {
@@ -1167,6 +1192,24 @@ fn main() {
     let per_bucket = (est_ev / nthreads / NB_E) * 5 / 4 + 16;
 
     tick("setup");
+    if std::env::var("SS_COLL").is_ok() {
+        let mut v: Vec<(u64, &'static [u8])> = Vec::new();
+        let mut uv: Vec<(u64, &'static [u8])> = Vec::new();
+        let mut f: [&'static [u8]; 7] = [&[]; 7];
+        for &d in &ev_files {
+            for l in lines_after_header(d) {
+                if split::<7>(l, &mut f) { v.push((hash_bytes(f[0]), f[0])); uv.push((hash_bytes(f[1]), f[1])); }
+            }
+        }
+        for (name, mut v) in [("eid", v), ("user", uv)] {
+            v.sort_unstable();
+            v.dedup();
+            let mut c = 0;
+            for w in v.windows(2) { if w[0].0 == w[1].0 { c += 1; if c < 5 { eprintln!("{} collision {:?} {:?}", name, String::from_utf8_lossy(w[0].1), String::from_utf8_lossy(w[1].1)); } } }
+            eprintln!("{} distinct {} collisions {}", name, v.len(), c);
+        }
+        return;
+    }
     if std::env::var("SS_BENCH").is_ok() {
         let mode: u32 = std::env::var("SS_BENCH").unwrap().parse().unwrap();
         let t = std::time::Instant::now();
@@ -1202,7 +1245,9 @@ fn main() {
             let linkmap = &linkmap;
             hs.push(s.spawn(move || {
                 if t == 0 {
+                    let tl = std::time::Instant::now();
                     let lm = build_links(lk_files);
+                    if std::env::var("SS_TIMING").is_ok() { eprintln!("  links built in {:.1} ms", tl.elapsed().as_secs_f64()*1e3); }
                     *linkmap.lock().unwrap() = Some(lm);
                 }
                 let mut eb: Vec<Vec<ERec>> = (0..NB_E).map(|_| Vec::with_capacity(per_bucket)).collect();
@@ -1279,10 +1324,13 @@ fn main() {
                                         break;
                                     }
                                     if kk == r.eid {
-                                        if r.ingest < get(tidx[i]).ingest {
-                                            tidx[i] = code;
+                                        let cur = get(tidx[i]);
+                                        if unpack(cur.eref) == unpack(r.eref) {
+                                            if r.ingest < cur.ingest {
+                                                tidx[i] = code;
+                                            }
+                                            break;
                                         }
-                                        break;
                                     }
                                     i = (i + 1) & mask;
                                 }
@@ -1297,10 +1345,19 @@ fn main() {
                                 }
                                 let code = ((ti as u32) << 26) | ri as u32;
                                 let mut i = (r.eid as usize) & mask;
-                                while tkeys[i] != r.eid {
+                                let mine = loop {
+                                    if tkeys[i] == r.eid {
+                                        let w = tidx[i];
+                                        if w == code {
+                                            break true;
+                                        }
+                                        if unpack(get(w).eref) == unpack(r.eref) {
+                                            break false;
+                                        }
+                                    }
                                     i = (i + 1) & mask;
-                                }
-                                if tidx[i] == code {
+                                };
+                                if mine {
                                     win.push(PRec { person: r.user, ts: r.ts, nref: r.uref, price: r.price, cat: r.cat, typ: r.typ, _pad: 0 });
                                 }
                             }
@@ -1398,7 +1455,9 @@ fn main() {
                     }
                     process_bucket(&mut evs, &mut cls, ctxr, ws_day, ncamp, &mut rows, &mut acc, &mut sc);
                 }
+                let tw = std::time::Instant::now();
                 pq::write_user(&user_dir.join(format!("part-{t:03}.parquet")), &rows, cats_r);
+                if std::env::var("SS_TIMING").is_ok() { eprintln!("  thread {t} write {:.1} ms rows {}", tw.elapsed().as_secs_f64()*1e3, rows.len()); }
                 accs.lock().unwrap().push(acc);
             });
         }
